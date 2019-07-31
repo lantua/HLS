@@ -671,15 +671,18 @@ static int hdrr_delete(struct Qdisc *sch, unsigned long arg)
 	struct Qdisc *new_q = NULL;
 
     printk(KERN_DEBUG "Deleting %d", cl->common.classid);
-	/* TODO: why don't allow to delete subtree ? references ? does
-	 * tc subsys guarantee us that in hdrr_destroy it holds no class
-	 * refs so that we can remove children safely there ?
-	 */
-	if (cl->filter_cnt)
+
+    /*
+     * TODO: If we want to delete internal class, we can either leave its
+     * children be, resulting in splitted forest, or we can recursively delete
+     * the children. Either way we need to add more logic.
+     */
+	if (!is_leaf(cl) || cl->filter_cnt)
 		return -EBUSY;
 
 	sch_tree_lock(sch);
-
+i
+    // Should always be true as is, but keep it here in case we add internal-class logic
 	if (is_leaf(cl)) {
 		unsigned int qlen = cl->leaf.q->q.qlen;
 		unsigned int backlog = cl->leaf.q->qstats.backlog;
