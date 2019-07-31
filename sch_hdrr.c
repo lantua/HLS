@@ -54,8 +54,6 @@ struct hdrr_class {
 	struct tcf_block        *block;
 	int                     filter_cnt;
 
-	struct work_struct	work;
-
 	struct hdrr_class	*parent;
 
 	struct gnet_stats_basic_packed  basic_stats;
@@ -91,6 +89,10 @@ struct hdrr_sched {
 	/* filters for qdisc itself */
 	struct tcf_proto __rcu	*filter_list;
 	struct tcf_block	*block;
+
+	struct qdisc_watchdog   watchdog;
+    struct psched_ratecfg   rate;
+    s64                     next_available;
 
 	int			direct_qlen;
     int quantum_multiplier;
@@ -377,10 +379,20 @@ static struct sk_buff *hdrr_dequeue(struct Qdisc *sch) {
     struct hdrr_class *prev;
 
     struct sk_buff *skb = NULL;
+    bool is_direct = false;
+    s64 now = 0;
 
 	skb = __qdisc_dequeue_head(&q->direct_queue);
-	if (skb != NULL || !sch->q.qlen || !cl)
+	if (skb != NULL || !sch->q.qlen || !cl) {
+        is_direct = true;
 		goto end;
+    }
+
+    if (q->rate.rate_bytes_ps != 0 && q->next_available > (now = ktime_get_ns())) {
+        // Deny transmission, setup timer for next sending time.
+        qdisc_watchdog_schedule_ns(&q->watchdog, q->next_available);
+        goto end;
+    }
 
     // Since sch->q.qlen != 0, we are guaranteed to have at least one packet.
     do {
@@ -415,6 +427,10 @@ end:
         qdisc_bstats_update(sch, skb);
         qdisc_qstats_backlog_dec(sch, skb);
         sch->q.qlen--;
+
+        if (q->rate.rate_bytes_ps && !is_direct) {
+            q->next_available = now + (s64)psched_l2t_ns(&q->rate, qdisc_pkt_len(skb));
+        }
     }
     return skb;
 }
@@ -444,6 +460,9 @@ static void hdrr_reset(struct Qdisc *sch) {
             cl->drop_count = 0;
 		}
 	}
+    if (q->rate.rate_bytes_ps != 0)
+        qdisc_watchdog_cancel(&q->watchdog);
+    __qdisc_reset_queue(&q->direct_queue);
 	sch->q.qlen = 0;
 	sch->qstats.backlog = 0;
 }
@@ -457,6 +476,7 @@ static int hdrr_init(struct Qdisc *sch, struct nlattr *opt) {
     struct hdrr_sched *q = qdisc_priv(sch);
 	struct nlattr *tb[TCA_HDRR_MAX + 1];
     struct tc_hdrr_glob *gopt;
+    struct tc_ratespec rate_spec;
 
     int err;
 
@@ -488,6 +508,15 @@ static int hdrr_init(struct Qdisc *sch, struct nlattr *opt) {
 		q->direct_qlen = gopt->direct_qlen;
 	else
 		q->direct_qlen = qdisc_dev(sch)->tx_queue_len;
+
+    q->rate.rate_bytes_ps = gopt->rate;
+    if (gopt->rate != 0) {
+        memset(&rate_spec, 0, sizeof(rate_spec));
+        rate_spec.rate = gopt->rate;
+        psched_ratecfg_precompute(&q->rate, &rate_spec, gopt->rate);
+        qdisc_watchdog_init(&q->watchdog, sch);
+        q->next_available = ktime_get_ns();
+    }
 
     q->default_class = gopt->defcls;
     q->quantum_multiplier = gopt->qmul;
