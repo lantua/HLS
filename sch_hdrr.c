@@ -69,8 +69,6 @@ struct hdrr_class {
             struct Qdisc	*q;
 
             int is_active;
-            int active_round;
-            int idle_count_until_remove;
 
             struct hdrr_class *next_leaf;
             struct hdrr_class *prev_leaf;
@@ -107,13 +105,15 @@ struct hdrr_sched {
 	long                    direct_pkts;
 
     // Current state of the scheduler
-    int round;
     struct hdrr_class *active_class;
     struct hdrr_class *root;
     struct hdrr_class *current_subtree;
 };
 
+static inline bool hdrr_verify(struct hdrr_sched* q);
+
 static inline int div_round_up(int numerator, int denominator) {
+    WARN_ON(denominator == 0);
     return (numerator + denominator - 1) / denominator;
 }
 
@@ -127,47 +127,71 @@ static inline bool is_attached_inner(struct hdrr_class *cl) { return cl->inner.f
 
 static inline unsigned int classid(struct hdrr_class *cl) { return cl->common.classid & 0xffff; }
 
-static inline void set_threshold(struct hdrr_class *ancestor, int candidate) {
+static inline int required_quota_inner(struct hdrr_class *ancestor) {
+    return ancestor->inner.fairshare_threshold * ancestor->inner.active_weight - ancestor->quota;
+}
+
+static inline void take_quota(struct hdrr_class *cl) {
+    WARN_ON(cl == NULL);
+    cl->quota += cl->parent->inner.fairshare * cl->weight;
+    printk("Add quota to %u Q%+d (%d)", classid(cl), cl->parent->inner.fairshare * cl->weight, cl->quota);
+}
+
+#define set_threshold(x, y) set_threshold_imp(x, y, __LINE__)
+
+static inline void set_threshold_imp(struct hdrr_class *ancestor, int candidate, int line_number) {
+    WARN_ON(ancestor == NULL);
+    WARN_ON(candidate < 0);
+
     if (ancestor->inner.fairshare_threshold > candidate) {
         ancestor->inner.fairshare_threshold = candidate;
     }
-    printk(KERN_DEBUG "Setting threshold of %u to %d, uses %d", classid(ancestor), candidate, ancestor->inner.fairshare_threshold);
+    //printk(KERN_DEBUG "Setting threshold of %u to %d, uses %d", classid(ancestor), candidate, ancestor->inner.fairshare_threshold);
 }
 
 static inline void add_subtree(struct hdrr_sched *q, struct hdrr_class *cl) {
+    WARN_ON(cl == NULL);
     if (cl->inner.next_subtree == NULL) {
         cl->inner.next_subtree = q->current_subtree->inner.next_subtree;
         q->current_subtree->inner.next_subtree = cl;
-        printk(KERN_DEBUG "Inserting subtree %u", classid(cl));
+        //printk(KERN_DEBUG "Inserting subtree %u", classid(cl));
     }
 }
 
 static inline void advance_subtree(struct hdrr_sched *q) {
-    struct hdrr_class *tmp = q->current_subtree;
+    struct hdrr_class *tmp;
+    int max_loop = 5;
 
-    q->current_subtree = tmp->inner.next_subtree;
-    tmp->inner.next_subtree = NULL;
+    while (required_quota_inner(q->current_subtree) > 0 && is_active_inner(q->current_subtree) && max_loop-- >= 0) {
+        tmp = q->current_subtree;
+        q->current_subtree = NULL;// tmp->inner.next_subtree; // TODO: Change back
+        tmp->inner.next_subtree = NULL;
 
-    if (q->current_subtree == NULL) {
-        const int round_size = 1000000;
-        const int added = div_round_up(q->root->inner.fairshare_threshold * q->root->inner.active_weight, round_size);
-        q->root->quota = added;
-        q->current_subtree = q->root;
-        printk(KERN_DEBUG "Root threshold %d, Q%+d (%d)", q->root->inner.fairshare_threshold, added, q->root->quota);
+        if (q->current_subtree == NULL) {
+            const int round_size = 1000;
+            const int required = required_quota_inner(q->root);
+            const int added = div_round_up(required, round_size) * round_size;
+            q->root->quota += added;
+            q->current_subtree = q->root;
+            printk(KERN_DEBUG "Root threshold %d, required %d, Q%+d (%d)", q->root->inner.fairshare_threshold, required, added, q->root->quota);
+            break;
+        }
     }
-    printk(KERN_DEBUG "Advance (%d) subtree from %u to %u", q->round, classid(tmp), classid(q->current_subtree));
+    //printk(KERN_DEBUG "Advanced subtree to %u", classid(q->current_subtree));
 }
 
 static inline void attach_leaf(struct hdrr_class *cl) {
     struct hdrr_class* old_first;
     struct hdrr_class* ancestor;
 
+    WARN_ON(cl == NULL);
+
     if (is_attached_leaf(cl)) {
-        printk(KERN_ERR "Attaching attached %u", classid(cl));
+        //printk(KERN_ERR "Attaching attached %u", classid(cl));
         return;
     }
 
-    printk(KERN_DEBUG "Attaching %u", classid(cl));
+    //printk(KERN_DEBUG "Attaching %u", classid(cl));
 
     for (ancestor = cl->parent; ancestor != NULL && !is_attached_inner(ancestor); ancestor = ancestor->parent) {
         // Unattached ancestor
@@ -186,33 +210,28 @@ static inline void attach_leaf(struct hdrr_class *cl) {
         for (; (ancestor != NULL) && ancestor->inner.first_leaf == old_first; ancestor = ancestor->parent) {
             ancestor->inner.first_leaf = cl;
         }
+
+        //printk(KERN_DEBUG "Attached %u before %u", classid(cl), classid(old_first));
     } else {
         // First active leaf in the entire tree
         cl->leaf.next_leaf = cl;
         cl->leaf.prev_leaf = cl;
-    }
 
-    printk(KERN_DEBUG "Attached %u", classid(cl));
+        //printk(KERN_DEBUG "First Attached %u", classid(cl));
+    }
 }
 
 static inline void detach_leaf(struct hdrr_class *cl) {
     struct hdrr_class* ancestor;
 
+    WARN_ON(cl == NULL);
+
     if (!is_attached_leaf(cl)) {
-        printk(KERN_ERR "Detaching unattached %u", classid(cl));
+        //printk(KERN_ERR "Detaching unattached %u", classid(cl));
         return;
     }
 
-    if (--cl->leaf.idle_count_until_remove >= 0) {
-        return;
-    }
-
-    printk(KERN_DEBUG "Detaching %u", classid(cl));
-
-    cl->leaf.next_leaf->leaf.prev_leaf = cl->leaf.prev_leaf;
-    cl->leaf.prev_leaf->leaf.next_leaf = cl->leaf.next_leaf;
-    cl->leaf.next_leaf = NULL;
-    cl->leaf.prev_leaf = NULL;
+    //printk(KERN_DEBUG "Detaching %u", classid(cl));
 
     for (ancestor = cl->parent; ancestor != NULL && ancestor->inner.first_leaf == cl && ancestor->inner.last_leaf == cl; ancestor = ancestor->parent) {
         // Only child, detach ancestor
@@ -234,17 +253,23 @@ static inline void detach_leaf(struct hdrr_class *cl) {
         }
     }
 
-    printk(KERN_DEBUG "Detached %u", classid(cl));
+    cl->leaf.next_leaf->leaf.prev_leaf = cl->leaf.prev_leaf;
+    cl->leaf.prev_leaf->leaf.next_leaf = cl->leaf.next_leaf;
+    cl->leaf.next_leaf = NULL;
+    cl->leaf.prev_leaf = NULL;
+
+    //printk(KERN_DEBUG "Detached %u", classid(cl));
 }
 
 static inline void activate_leaf(struct hdrr_class *cl) {
     struct hdrr_class* ancestor;
     int weight = cl->weight;
 
-    printk(KERN_DEBUG "Activating %u", classid(cl));
+    WARN_ON(cl == NULL);
+
+    //printk(KERN_DEBUG "Activating %u", classid(cl));
 
     cl->leaf.is_active = true;
-    cl->leaf.idle_count_until_remove = 1000;
 
     for (ancestor = cl->parent; ancestor != NULL && ancestor->inner.active_weight == 0; ancestor = ancestor->parent) {
         // Inactive ancestor
@@ -259,7 +284,7 @@ static inline void activate_leaf(struct hdrr_class *cl) {
         set_threshold(ancestor, 0);
     }
 
-    printk(KERN_DEBUG "Activated %u", classid(cl));
+    //printk(KERN_DEBUG "Activated %u q %d", classid(cl), cl->quota);
 }
 
 static inline void deactivate_leaf(struct hdrr_class *cl) {
@@ -269,7 +294,11 @@ static inline void deactivate_leaf(struct hdrr_class *cl) {
     int quota = cl->quota;
     cl->quota = 0;
 
-    printk(KERN_DEBUG "Deactivating %u", classid(cl));
+    WARN_ON(cl == NULL);
+
+    //printk(KERN_DEBUG "Deactivating %u", classid(cl));
+
+    //printk(KERN_DEBUG "Quota = %d from %u", quota, classid(cl));
 
     cl->xstats.mark_idle_count += 1;
     cl->leaf.is_active = false;
@@ -277,6 +306,7 @@ static inline void deactivate_leaf(struct hdrr_class *cl) {
     for (ancestor = cl->parent; ancestor != NULL && ancestor->inner.active_weight == weight; ancestor = ancestor->parent) {
         // Ancestor with only `cl` as active leaf, deactivate it
         quota += ancestor->quota;
+        //printk(KERN_DEBUG "Q += %d, from %u", ancestor->quota, classid(ancestor));
         ancestor->quota = 0;
 
         weight = ancestor->weight;
@@ -289,16 +319,140 @@ static inline void deactivate_leaf(struct hdrr_class *cl) {
         printk(KERN_INFO "Donate to %u Q%+d (%d)", classid(ancestor), quota, ancestor->quota);
     }
 
-    printk(KERN_DEBUG "Deactivated %u", classid(cl));
+    //printk(KERN_DEBUG "Deactivated %u", classid(cl));
 }
 
 static struct hdrr_class* enter_leaf(struct hdrr_class* subtree, struct hdrr_class* ancestor, struct hdrr_class *cl) {
+    struct hdrr_class* result = NULL;
+
+    WARN_ON(ancestor == NULL);
+
+    if ((ancestor->inner.first_leaf == cl) != (ancestor->inner.fairshare == -1))
+        printk(KERN_ERR "Error at line %d ancestor %u class %u", __LINE__, classid(ancestor), classid(cl));
+
+    if (ancestor->inner.fairshare != -1) {
+        return NULL;
+    }
+
+    //printk(KERN_DEBUG "Entering %u", classid(ancestor));
+    if (ancestor != subtree) {
+        if (ancestor->parent == NULL) {
+            if (subtree != NULL) {
+                printk(KERN_ERR "Bad subtree %u, ancestor %u, cl %u", classid(subtree), classid(ancestor), classid(cl));
+            } else {
+                printk(KERN_ERR "Bad subtree -, ancestor %u, cl %u", classid(ancestor), classid(cl));
+            }
+        }
+        WARN_ON(ancestor->parent == NULL);
+        result = enter_leaf(subtree, ancestor->parent, cl);
+
+        if (!is_active_inner(ancestor)) {
+            return result ? result : ancestor;
+        }
+
+        if (result == NULL) {
+            take_quota(ancestor);
+        }
+    }
+
+    if (required_quota_inner(ancestor) > 0) {
+        // Doesn't reach threshold.
+        printk(KERN_DEBUG "Doesn't meet threshold of %d at subtree %u, have %d", ancestor->inner.fairshare_threshold * ancestor->inner.active_weight, classid(ancestor), ancestor->quota);
+        return result ? result : ancestor;
+    }
+
+    WARN_ON(ancestor->inner.active_weight == 0);
+
+    ancestor->inner.fairshare_threshold = 0x7fffffff;
+    ancestor->inner.fairshare = ancestor->quota / ancestor->inner.active_weight;
+    ancestor->quota %= ancestor->inner.active_weight;
+    printk("Set fairshare of %u to %d (ac %d)", classid(ancestor), ancestor->inner.fairshare, ancestor->inner.active_weight);
+
     return NULL;
 }
 
+static void leave_leaf(struct hdrr_sched* q, struct hdrr_class* ancestor, struct hdrr_class *cl) {
+    WARN_ON(ancestor == NULL || cl == NULL);
+        
+    for (; ancestor->parent != NULL && cl == ancestor->inner.last_leaf; ancestor = ancestor->parent) {
+        const int wanted = required_quota_inner(ancestor);
+
+        //printk(KERN_DEBUG "Leaving %u", classid(ancestor));
+
+        if (wanted > 0) {
+            set_threshold(ancestor->parent, div_round_up(wanted, ancestor->weight));
+        } else {
+            set_threshold(ancestor->parent, 0);
+            add_subtree(q, ancestor);
+        }
+
+        ancestor->inner.fairshare = -1;
+    }
+
+    if (ancestor->inner.last_leaf == cl) {
+        //printk(KERN_DEBUG "Leaving root %u", classid(ancestor));
+        ancestor->inner.fairshare = -1;
+    }
+
+    //printk(KERN_DEBUG "Left %u, stop at %u with last class %u", classid(cl), classid(ancestor), classid(ancestor->inner.last_leaf));
+}
+
 static inline struct hdrr_class* advance_leaf(struct hdrr_sched* q, struct hdrr_class* cl) {
-    cl->quota += 10000;
-    return cl->leaf.next_leaf;
+    int max_loop = 20;
+    struct hdrr_class* ancestor;
+
+    WARN_ON(cl == NULL);
+
+    if (unlikely(cl->parent == NULL)) {
+        // Single-class hierarchy
+        cl->quota = 0x7fffffff;
+        return cl;
+    }
+
+    //printk(KERN_DEBUG "Advancing from %u", classid(cl));
+
+    ancestor = cl->parent;
+    if (cl->quota < 0) {
+        set_threshold(ancestor, div_round_up(-cl->quota, cl->weight));
+    }
+
+    do {
+        WARN_ON(ancestor == NULL);
+        //printk(KERN_DEBUG "Leaving leaf %u (%u)", classid(cl), classid(ancestor));
+        leave_leaf(q, ancestor, cl);
+        //printk(KERN_DEBUG "Left leaf %u (%u)", classid(cl), classid(ancestor));
+        if (q->current_subtree->inner.last_leaf == cl) {
+            advance_subtree(q);
+            if (q->current_subtree->inner.first_leaf == NULL) {
+                printk(KERN_ERR "Error at line %d on subtree %u", __LINE__, classid(q->current_subtree));
+                return cl;
+            }
+            cl = q->current_subtree->inner.first_leaf;
+        } else {
+            cl = cl->leaf.next_leaf;
+        }
+
+        //printk(KERN_DEBUG "Entering leaf %u (%u)", classid(cl), classid(cl->parent));
+        WARN_ON(cl->parent == NULL);
+        ancestor = enter_leaf(q->current_subtree, cl->parent, cl);
+        //printk(KERN_DEBUG "Entered result %u", ancestor ? classid(ancestor) : 0);
+
+        if (ancestor != NULL) {
+            WARN_ON(cl == NULL);
+            cl = ancestor->inner.last_leaf;
+        }
+    } while (ancestor != NULL && --max_loop >= 0);
+
+    //printk(KERN_DEBUG "Settled at %u", classid(cl));
+
+    if (ancestor == NULL && is_active_leaf(cl)) {
+        //printk(KERN_DEBUG "QQ at %u", classid(cl));
+        take_quota(cl);
+    }
+
+    //printk(KERN_DEBUG "Advanced to %u->%u->%u", classid(cl), classid(cl->leaf.next_leaf), classid(cl->leaf.next_leaf->leaf.next_leaf));
+
+    return cl;
 }
 
 static inline void hdrr_internal_to_leaf(struct hdrr_sched *q, struct hdrr_class *cl,
@@ -306,7 +460,7 @@ static inline void hdrr_internal_to_leaf(struct hdrr_sched *q, struct hdrr_class
     WARN_ON(is_attached_inner(cl));
     WARN_ON(is_active_inner(cl));
 
-    printk(KERN_DEBUG "INTERNAL->LEAF %u", classid(cl));
+    //printk(KERN_DEBUG "INTERNAL->LEAF %u", classid(cl));
 
     memset(&cl->leaf, 0, sizeof(cl->leaf));
 
@@ -333,8 +487,6 @@ static inline struct hdrr_class *hdrr_find(u32 handle, struct Qdisc *sch)
 	struct hdrr_sched *q = qdisc_priv(sch);
 	struct Qdisc_class_common *clc;
 
-    printk(KERN_DEBUG "FIND %u", handle & 0xffff);
-
 	clc = qdisc_class_find(&q->clhash, handle);
 	if (clc == NULL)
 		return NULL;
@@ -344,7 +496,7 @@ static inline struct hdrr_class *hdrr_find(u32 handle, struct Qdisc *sch)
 
 static unsigned long hdrr_search(struct Qdisc *sch, u32 handle)
 {
-    printk(KERN_DEBUG "SEARCH %u", handle);
+    //printk(KERN_DEBUG "SEARCH %u", handle);
 	return (unsigned long)hdrr_find(handle, sch);
 }
 
@@ -402,8 +554,6 @@ static int hdrr_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff *
     struct hdrr_sched *q = qdisc_priv(sch);
     struct hdrr_class *cl = hdrr_classify(skb, sch, &ret);
 
-    printk(KERN_DEBUG "Enqueuing");
-
     if (!cl) {
         // No class found, push it to direct class
         // TODO: Should this be default behaviour?
@@ -415,8 +565,6 @@ static int hdrr_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff *
             return qdisc_drop(skb, sch, to_free);
         }
     }
-
-    printk(KERN_DEBUG "Enqueuing to %u", classid(cl));
 
     if ((ret = qdisc_enqueue(skb, cl->leaf.q, to_free)) != NET_XMIT_SUCCESS) {
         if (net_xmit_drop_count(ret)) {
@@ -431,9 +579,6 @@ static int hdrr_enqueue(struct sk_buff *skb, struct Qdisc *sch, struct sk_buff *
             attach_leaf(cl);
         }
         activate_leaf(cl);
-        cl->leaf.active_round = q->round;
-
-        printk(KERN_DEBUG "Activate %u round %d", classid(cl), q->round);
 
         if (unlikely(q->active_class == NULL)) {
             q->active_class = cl;
@@ -463,8 +608,6 @@ static struct sk_buff *hdrr_dequeue(struct Qdisc *sch) {
     int max_loop;
     s64 now = 0;
     
-    printk(KERN_DEBUG "Dequeue");
-
 	skb = __qdisc_dequeue_head(&q->direct_queue);
 	if (skb != NULL || !sch->q.qlen || !cl) {
         is_direct = true;
@@ -477,7 +620,12 @@ static struct sk_buff *hdrr_dequeue(struct Qdisc *sch) {
         goto end;
     }
 
+    if (!hdrr_verify(q)) {
+        goto end;
+    }
+
     for (max_loop = 1000; max_loop >= 0 && skb == NULL; max_loop--) {
+        WARN_ON(cl == NULL);
         if (is_active_leaf(cl)) {
             if (cl->quota < 0) {
                 cl = advance_leaf(q, cl);
@@ -494,6 +642,7 @@ static struct sk_buff *hdrr_dequeue(struct Qdisc *sch) {
         } else {
             prev = cl;
             cl = advance_leaf(q, prev);
+            WARN_ON(cl == NULL);
 
             detach_leaf(prev);
             if (prev == cl) {
@@ -512,6 +661,7 @@ static struct sk_buff *hdrr_dequeue(struct Qdisc *sch) {
 
 end:
     if (skb) {
+        //printk(KERN_DEBUG "Dequeued");
         qdisc_bstats_update(sch, skb);
         qdisc_qstats_backlog_dec(sch, skb);
         sch->q.qlen--;
@@ -520,6 +670,7 @@ end:
             q->next_available = now + (s64)psched_l2t_ns(&q->rate, qdisc_pkt_len(skb));
         }
     }
+
     return skb;
 }
 
@@ -536,7 +687,6 @@ static void hdrr_reset(struct Qdisc *sch) {
 				qdisc_reset(cl->leaf.q);
 
                 cl->leaf.is_active = false;
-                cl->leaf.idle_count_until_remove = 0;
                 cl->leaf.next_leaf = NULL;
                 cl->leaf.prev_leaf = NULL;
             } else {
@@ -624,7 +774,7 @@ static int hdrr_change_class(struct Qdisc *sch, u32 classid,
     struct nlattr *tb[TCA_HDRR_MAX + 1];
     struct tc_hdrr_opt *hopt;
 
-    printk(KERN_DEBUG "CHANGE %u", classid);
+    //printk(KERN_DEBUG "CHANGE %u", classid);
 
     if (!opt)
         goto failure;
@@ -809,7 +959,7 @@ static struct tcf_block *hdrr_tcf_block(struct Qdisc *sch, unsigned long arg)
 	struct hdrr_sched *q = qdisc_priv(sch);
 	struct hdrr_class *cl = (struct hdrr_class *)arg;
 
-    printk(KERN_DEBUG "TCF BLOCK %u", cl ? classid(cl) : 0);
+    //printk(KERN_DEBUG "TCF BLOCK %u", cl ? classid(cl) : 0);
 
 	return cl ? cl->block : q->block;
 }
@@ -842,7 +992,7 @@ static unsigned long hdrr_bind_filter(struct Qdisc *sch, unsigned long parent,
 				     u32 classid)
 {
 	struct hdrr_class *cl = hdrr_find(classid, sch);
-    printk(KERN_DEBUG "BIND %u", classid);
+    //printk(KERN_DEBUG "BIND %u", classid);
 
 	if (cl)
 		cl->filter_cnt++;
@@ -852,7 +1002,7 @@ static unsigned long hdrr_bind_filter(struct Qdisc *sch, unsigned long parent,
 static void hdrr_unbind_filter(struct Qdisc *sch, unsigned long arg)
 {
 	struct hdrr_class *cl = (struct hdrr_class *)arg;
-    printk(KERN_DEBUG "UNBIND %u", classid(cl));
+    //printk(KERN_DEBUG "UNBIND %u", classid(cl));
 
 	if (cl)
 		cl->filter_cnt--;
@@ -893,7 +1043,7 @@ static int hdrr_dump(struct Qdisc *sch, struct sk_buff *skb) {
         .direct_qlen = q->direct_qlen,
     };
 
-    printk(KERN_DEBUG "DUMP QDISC");
+    //printk(KERN_DEBUG "DUMP QDISC");
 
     nest = nla_nest_start(skb, TCA_OPTIONS);
     if (nest == NULL)
@@ -918,7 +1068,7 @@ static int hdrr_dump_class(struct Qdisc *sch, unsigned long arg,
     struct nlattr *nest;
     struct tc_hdrr_opt opt;
 
-    printk(KERN_DEBUG "DUMP %u", classid(cl));
+    //printk(KERN_DEBUG "DUMP %u", classid(cl));
 
     tcm->tcm_parent = cl->parent ? cl->parent->common.classid : TC_H_ROOT;
     tcm->tcm_handle = cl->common.classid;
@@ -950,7 +1100,7 @@ hdrr_dump_class_stats(struct Qdisc *sch, unsigned long arg, struct gnet_dump *d)
 
     __u32 qlen = 0;
 
-    printk(KERN_DEBUG "DUMPSTAT %u", classid(cl));
+    //printk(KERN_DEBUG "DUMPSTAT %u", classid(cl));
 
     if (is_leaf(cl) && cl->leaf.q) {
         qlen = cl->leaf.q->q.qlen;
@@ -963,6 +1113,104 @@ hdrr_dump_class_stats(struct Qdisc *sch, unsigned long arg, struct gnet_dump *d)
     }
 
     return gnet_stats_copy_app(d, &cl->xstats, sizeof(cl->xstats));
+}
+
+static inline bool hdrr_verify(struct hdrr_sched *q) {
+    int cycle_size = -1;
+	struct hdrr_class *cl;
+	unsigned int i;
+    bool reached[20];
+    bool past[20];
+    struct hdrr_class* ancestor;
+
+    memset(reached, 0, sizeof(reached));
+    memset(past, 0, sizeof(past));
+
+	for (i = 0; i < q->clhash.hashsize; i++) {
+		hlist_for_each_entry(cl, &q->clhash.hash[i], common.hnode) {
+            if (is_leaf(cl)) {
+                for (ancestor = cl->parent; ancestor->parent != NULL; ancestor = ancestor->parent);
+                if(ancestor != q->root) {
+                    printk(KERN_ERR "Verification failed at line %d for %u", __LINE__, classid(cl));
+                    return false;
+                }
+
+                if (is_active_leaf(cl) && !is_attached_leaf(cl)) {
+                    printk(KERN_ERR "Verification failed at line %d for %u", __LINE__, classid(cl));
+                    return false;
+                }
+                if (!cl->leaf.next_leaf != !cl->leaf.prev_leaf) {
+                    printk(KERN_ERR "Verification failed at line %d for %u", __LINE__, classid(cl));
+                    return false;
+                }
+                if (cl->leaf.next_leaf && cl->leaf.next_leaf->leaf.prev_leaf != cl) {
+                    printk(KERN_ERR "Verification failed at line %d for %u", __LINE__, classid(cl));
+                    return false;
+                }
+                if (cl->leaf.prev_leaf && cl->leaf.prev_leaf->leaf.next_leaf != cl) {
+                    printk(KERN_ERR "Verification failed at line %d for %u", __LINE__, classid(cl));
+                    return false;
+                }
+                if (cl->leaf.next_leaf) {
+                    struct hdrr_class* tmp = cl->leaf.next_leaf;
+                    int j;
+
+                    for (j = 1; tmp != NULL && tmp != cl; j++) {
+                        tmp = tmp->leaf.next_leaf;
+                    }
+
+                    if (cycle_size == -1) {
+                        cycle_size = j;
+                    } else if (cycle_size != j) {
+                        printk(KERN_ERR "Verification failed at line %d for %u", __LINE__, classid(cl));
+                        return false;
+                    }
+                }
+            } else {
+                if (is_active_inner(cl) && !is_attached_inner(cl)) {
+                    printk(KERN_ERR "Verification failed at line %d for %u", __LINE__, classid(cl));
+                    return false;
+                }
+                if (is_active_inner(cl) && (cl->inner.first_leaf == NULL || cl->inner.last_leaf == NULL)) {
+                    printk(KERN_ERR "Verification failed at line %d for %u", __LINE__, classid(cl));
+                    return false;
+                }
+            }
+		}
+	}
+
+    if (q->root->inner.first_leaf != NULL) {
+        for (cl = q->root->inner.first_leaf; true; cl = cl->leaf.next_leaf) {
+            for(ancestor = cl->parent; ancestor != q->root; ancestor = ancestor->parent) {
+                if (ancestor == NULL) {
+                    printk(KERN_ERR "Verification failed at line %d for %u", __LINE__, classid(cl));
+                    return false;
+                }
+                if (classid(ancestor) < 20) {
+                    if (!reached[classid(ancestor)] && ancestor->inner.first_leaf != cl) {
+                        printk(KERN_ERR "Verification failed at line %d for %u ancestor %u", __LINE__, classid(cl), classid(ancestor));
+                        return false;
+                    }
+                    reached[classid(ancestor)] = true;
+
+                    if (past[classid(ancestor)]) {
+                        printk(KERN_ERR "Verification failed at line %d for %u ancestor %u", __LINE__, classid(cl), classid(ancestor));
+                        return false;
+                    } else if (ancestor->inner.last_leaf == cl) {
+                        past[classid(ancestor)] = true;
+                    }
+                }
+            }
+            
+
+            if (cl == q->root->inner.last_leaf) {
+                break;
+            }
+        }
+    }
+
+    //printk(KERN_DEBUG "Verification succeed");
+    return true;
 }
 
 static const struct Qdisc_class_ops hdrr_class_ops = {
