@@ -73,7 +73,7 @@ struct hdrr_class {
             bool is_active;
 		} leaf;
 		struct {
-            int active_weight; // sum of weight of active & busy children
+            int children_weight;
             int fairshare; // smallest value of `fairshare` to trigger distribution
 
             int current_round;
@@ -111,7 +111,6 @@ void* const ll_tail = (void*)0x1;
 static inline bool is_leaf(struct hdrr_class *cl) { return cl->children_count == 0; }
 
 static inline bool is_active_leaf(struct hdrr_class *cl) { return cl->leaf.is_active; }
-static inline bool is_active_inner(struct hdrr_class *cl) { return cl->inner.active_weight != 0; }
 
 static inline bool is_attached_leaf(struct hdrr_class *cl) { return cl->leaf.next_leaf != NULL; }
 
@@ -127,6 +126,14 @@ static inline int take_quota(struct hdrr_class *cl) {
     return amount;
 }
 
+static inline void compute_fairshare(struct hdrr_class *cl) {
+    if (cl->quota <= 0) {
+        cl->inner.fairshare = 0;
+    } else {
+        cl->inner.fairshare = (cl->quota + cl->inner.children_weight) / cl->inner.children_weight;
+    }
+}
+
 static inline void attach_leaf(struct hdrr_class *cl, struct hdrr_sched *q) {
     if (!is_attached_leaf(cl)) {
         cl->leaf.next_leaf = q->first_leaf;
@@ -135,56 +142,17 @@ static inline void attach_leaf(struct hdrr_class *cl, struct hdrr_sched *q) {
 }
 
 static inline struct hdrr_class* get_leaf_at(struct hdrr_class **cl_ptr) {
-    struct hdrr_class *cl = NULL;
-
-    while((cl = *cl_ptr) != ll_tail && !is_active_leaf(cl)) {
-        *cl_ptr = cl->leaf.next_leaf;
-        cl->leaf.next_leaf = NULL;
-    }
-    return cl;
+    return *cl_ptr;
 }
 
 static inline void activate_leaf(struct hdrr_class *cl) {
-    struct hdrr_class* ancestor;
-    int weight = cl->weight;
-
     cl->leaf.is_active = true;
-
-    for (ancestor = cl->parent; ancestor != NULL && ancestor->inner.active_weight == 0; ancestor = ancestor->parent) {
-        // Inactive ancestor
-        ancestor->inner.active_weight = weight;
-        weight = ancestor->weight;
-    }
-
-    if (ancestor != NULL) {
-        // First active ancestor
-        ancestor->inner.active_weight += weight;
-    }
 }
 
 static inline void deactivate_leaf(struct hdrr_class *cl) {
-    struct hdrr_class* ancestor;
-    int weight = cl->weight;
-    int quota = cl->quota;
-
     cl->leaf.is_active = false;
     cl->quota = 0;
     cl->xstats.mark_idle_count += 1;
-
-    for (ancestor = cl->parent; ancestor != NULL && ancestor->inner.active_weight == weight; ancestor = ancestor->parent) {
-        // Ancestor with only `cl` as active leaf, deactivate it
-        quota += ancestor->quota;
-        ancestor->quota = 0;
-
-        weight = ancestor->weight;
-        ancestor->inner.active_weight = 0;
-        ancestor->inner.fairshare = 0;
-    }
-    if (ancestor != NULL) {
-        // Ancestor that remains active
-        ancestor->inner.active_weight -= weight;
-        ancestor->quota += quota;
-    }
 }
 
 static void enter_leaf(struct hdrr_class* ancestor, int round) {
@@ -198,7 +166,7 @@ static void enter_leaf(struct hdrr_class* ancestor, int round) {
         take_quota(ancestor);
     }
 
-    ancestor->inner.fairshare = max(ancestor->quota, 0) / ancestor->inner.active_weight;
+    compute_fairshare(ancestor);
 }
 
 static inline struct hdrr_class* advance_leaf(struct hdrr_sched* q, struct hdrr_class* cl) {
@@ -221,6 +189,10 @@ static inline struct hdrr_class* advance_leaf(struct hdrr_sched* q, struct hdrr_
 
         enter_leaf(next->parent, q->current_round);
         q->root->quota += take_quota(next);
+        if (!is_active_leaf(next)) {
+            next->quota = 0;
+            continue;
+        }
     } while (next->quota < 0 && (max_loop--) >= 0);
 
     return next;
@@ -228,8 +200,6 @@ static inline struct hdrr_class* advance_leaf(struct hdrr_sched* q, struct hdrr_
 
 static inline void hdrr_internal_to_leaf(struct hdrr_sched *q, struct hdrr_class *cl,
 			       struct Qdisc *new_q) {
-    WARN_ON(is_active_inner(cl));
-
     memset(&cl->leaf, 0, sizeof(cl->leaf));
 
     cl->leaf.q = new_q ? new_q : &noop_qdisc;
@@ -381,7 +351,6 @@ static struct sk_buff *hdrr_dequeue(struct Qdisc *sch) {
             if (skb != NULL) {
                 cl->quota -= qdisc_pkt_len(skb);
             } else {
-                q->root->quota -= cl->quota;
                 deactivate_leaf(cl);
             }
         } else {
@@ -554,12 +523,13 @@ static int hdrr_change_class(struct Qdisc *sch, u32 classid,
 
         sch_tree_lock(sch);
 
-        if (ancestor && is_leaf(ancestor)) {
+        if (ancestor) {
             if (is_leaf(ancestor)) {
                 hdrr_leaf_to_internal(ancestor);
             }
 
             ancestor->children_count += 1;
+            ancestor->inner.children_weight += hopt->weight;
         }
 
         qdisc_class_hash_insert(&q->clhash, &cl->common);
