@@ -1,4 +1,4 @@
-SCHED=hdrr
+SCHED=hls
 obj-m += sch_${SCHED}.o
 
 REGISTER_MOD=${SCHED}
@@ -14,7 +14,11 @@ ${obj-m:.o=.ko}: %.ko: base
 clean:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
 
+unregister:
+	sudo tc qdisc del dev lo root || true
+	sudo rmmod sch_${REGISTER_MOD} || true
+
 register: sch_${REGISTER_MOD}.ko
-	sudo tc qdisc del dev ifb0 root || true
+	sudo tc qdisc del dev lo root || true
 	sudo rmmod sch_${REGISTER_MOD} || true
 	sudo insmod ./sch_${REGISTER_MOD}.ko
