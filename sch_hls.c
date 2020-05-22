@@ -48,6 +48,9 @@ struct hls_class {
 	struct gnet_stats_queue		qstats;
 	struct net_rate_estimator __rcu *rate_est;
 
+	struct tcf_proto __rcu  *filter_list;	/* class attached filters */
+	struct tcf_block        *block;
+
     struct hls_class* parent;
     u32 weight, children_count;
     int quota;
@@ -278,6 +281,12 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 	if (cl == NULL)
 		return -ENOBUFS;
 
+    err = tcf_block_get(&cl->block, &cl->filter_list, sch);
+    if (err) {
+        kfree(cl);
+        return err;
+    }
+
 	cl->common.classid = classid;
 	cl->quantum	   = quantum;
 	cl->leaf.qdisc	   = qdisc_create_dflt(sch->dev_queue,
@@ -346,12 +355,13 @@ static unsigned long hls_search_class(struct Qdisc *sch, u32 classid)
 	return (unsigned long)hls_find_class(sch, classid);
 }
 
-static struct tcf_block *hls_tcf_block(struct Qdisc *sch, unsigned long cl)
+static struct tcf_block *hls_tcf_block(struct Qdisc *sch, unsigned long arg)
 {
 	struct hls_sched *q = qdisc_priv(sch);
+    struct hls_class *cl = (struct hls_class *)arg;
 
 	if (cl)
-		return NULL;
+		return cl->block;
 
 	return q->block;
 }
@@ -479,19 +489,26 @@ static struct hls_class *hls_classify(struct sk_buff *skb, struct Qdisc *sch,
 	struct hls_sched *q = qdisc_priv(sch);
 	struct hls_class *cl;
 	struct tcf_result res;
-	struct tcf_proto *fl;
-	int result;
+	struct tcf_proto *fl = NULL;
+    int result;
 
 	if (TC_H_MAJ(skb->priority ^ sch->handle) == 0) {
 		cl = hls_find_class(sch, skb->priority);
-		if (cl != NULL)
-			return cl;
+        if (cl != NULL) {
+		    if (hls_is_leaf(cl))
+                return cl;
+
+            fl = rcu_dereference_bh(cl->filter_list);
+        }
 	}
 
+    // If we don't have class filter to start with, use qdisc filter.
+    if (fl == NULL) 
+	    fl = rcu_dereference_bh(q->filter_list);
+
 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
-	fl = rcu_dereference_bh(q->filter_list);
-	result = tcf_classify(skb, fl, &res, false);
-	if (result >= 0) {
+
+    while (fl && (result = tcf_classify(skb, fl, &res, false)) >= 0) {
 #ifdef CONFIG_NET_CLS_ACT
 		switch (result) {
 		case TC_ACT_QUEUED:
@@ -504,10 +521,22 @@ static struct hls_class *hls_classify(struct sk_buff *skb, struct Qdisc *sch,
 		}
 #endif
 		cl = (struct hls_class *)res.class;
-		if (cl == NULL)
+		if (cl == NULL) {
 			cl = hls_find_class(sch, res.classid);
-		return cl;
-	}
+            if (!cl) {
+                // Invalid class
+                break;
+            }
+        }
+
+        if (hls_is_leaf(cl))
+            return cl;
+
+        // Internal class, retrieve new filter chain.
+        fl = rcu_dereference_bh(cl->filter_list);
+    }
+
+    // No appropriate class found
 	return NULL;
 }
 
