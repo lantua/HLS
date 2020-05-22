@@ -38,6 +38,8 @@ enum {
 };
 #define TCA_HLS_MAX (__TCA_HLS_MAX - 1)
 
+typedef u16 Round;
+
 struct hls_class {
 	struct Qdisc_class_common	common;
 	unsigned int			filter_cnt;
@@ -46,7 +48,22 @@ struct hls_class {
 	struct gnet_stats_queue		qstats;
 	struct net_rate_estimator __rcu *rate_est;
 	struct list_head		alist;
-	struct Qdisc			*qdisc;
+
+    struct hls_class* parent;
+    u32 weight, children_count;
+    int quota;
+
+    union {
+        struct {
+            u32 fairshare;
+            u32 active_children_weight;
+            Round round;
+        } inner;
+        struct {
+            struct list_head active_list;
+	        struct Qdisc *qdisc;
+        } leaf;
+    };
 
 	u32				quantum;
 	u32				deficit;
@@ -57,7 +74,107 @@ struct hls_sched {
 	struct tcf_proto __rcu		*filter_list;
 	struct tcf_block		*block;
 	struct Qdisc_class_hash		clhash;
+
+    struct hls_class *root;
+    struct list_head active_leaves;
+    Round round;
 };
+
+static bool hls_is_leaf(struct hls_class* cl) { return cl->children_count == 0; }
+static bool hls_is_active_leaf(struct hls_class* cl) { return cl->leaf.qdisc->q.qlen; }
+static bool hls_is_active_inner(struct hls_class* cl) { return cl->inner.active_children_weight != 0; }
+
+static inline struct hls_class *hls_find(u32 handle, struct Qdisc *sch) {
+	struct hls_sched *q = qdisc_priv(sch);
+	struct Qdisc_class_common *clc;
+
+	clc = qdisc_class_find(&q->clhash, handle);
+	if (clc == NULL)
+		return NULL;
+
+	return container_of(clc, struct hls_class, common);
+}
+
+static void hls_compute_fairshare(struct hls_class* cl) {
+    if (cl->quota <= 0) {
+        cl->inner.fairshare = 0;
+    } else {
+        u32 fairshare = cl->quota / cl->inner.active_children_weight + 1;
+        cl->inner.fairshare = fairshare;
+        cl->quota -= fairshare * cl->inner.active_children_weight;
+    }
+}
+
+static void hls_take_quota(struct hls_class* cl) {
+    cl->quota = cl->parent->inner.fairshare * cl->weight;
+}
+
+static void hls_activate_inner(struct hls_class* cl, Round round) {
+    struct hls_class* parent = cl->parent;
+
+    if (hls_is_active_inner(cl)) {
+        return;
+    }
+
+    if (parent != NULL) {
+        if (parent->inner.active_children_weight == 0) {
+            hls_activate_inner(parent, round);
+        }
+        parent->inner.active_children_weight += cl->weight;
+    }
+
+    cl->inner.round = round;
+}
+
+static void hls_activate_leaf(struct hls_class* cl, struct hls_sched *q) {
+    struct hls_class* parent = cl->parent;
+    Round round = q->round;
+
+    if (hls_is_active_leaf(cl))
+        return;
+
+    if (parent != NULL) {
+        if (parent->inner.active_children_weight == 0) {
+            hls_activate_inner(parent, round);
+        }
+        parent->inner.active_children_weight += cl->weight;
+    }
+
+    list_add_tail(&cl->leaf.active_list, &q->active_leaves);
+}
+
+static void hls_deactivate_inner(struct hls_class* cl) {
+    struct hls_class *parent = cl->parent;
+
+    if (parent != NULL) {
+        parent->quota += cl->quota;
+        cl->quota = 0;
+        parent->inner.active_children_weight -= cl->weight;
+        if (parent->inner.active_children_weight == 0) {
+            hls_deactivate_inner(parent);
+        }
+    }
+
+    cl->inner.fairshare = 0;
+}
+
+static void hls_deactivate_leaf(struct hls_class* cl) {
+    struct hls_class *parent = cl->parent;
+
+    if (!hls_is_active_leaf(cl))
+        return;
+
+    if (parent != NULL) {
+        parent->quota += cl->quota;
+        cl->quota = 0;
+        parent->inner.active_children_weight -= cl->weight;
+        if (parent->inner.active_children_weight == 0) {
+            hls_deactivate_inner(parent);
+        }
+    }
+
+    list_del(&cl->leaf.active_list);
+}
 
 static struct hls_class *hls_find_class(struct Qdisc *sch, u32 classid)
 {
@@ -72,11 +189,11 @@ static struct hls_class *hls_find_class(struct Qdisc *sch, u32 classid)
 
 static void hls_purge_queue(struct hls_class *cl)
 {
-	unsigned int len = cl->qdisc->q.qlen;
-	unsigned int backlog = cl->qdisc->qstats.backlog;
+	unsigned int len = cl->leaf.qdisc->q.qlen;
+	unsigned int backlog = cl->leaf.qdisc->qstats.backlog;
 
-	qdisc_reset(cl->qdisc);
-	qdisc_tree_reduce_backlog(cl->qdisc, len, backlog);
+	qdisc_reset(cl->leaf.qdisc);
+	qdisc_tree_reduce_backlog(cl->leaf.qdisc, len, backlog);
 }
 
 static const struct nla_policy hls_policy[TCA_HLS_MAX + 1] = {
@@ -84,11 +201,44 @@ static const struct nla_policy hls_policy[TCA_HLS_MAX + 1] = {
     [TCA_HLS_INIT] = { .len = sizeof(struct tc_hls_glob) },
 };
 
+/// Child must be deactivated
+static void hls_attach_child(struct hls_class *child, struct hls_class *parent, struct hls_sched* q) {
+    if (unlikely(parent == NULL))
+        return;
+
+    if (parent->children_count == 0) {
+        // parent is leaf, change to inner.
+        hls_purge_queue(parent);
+        hls_deactivate_leaf(parent);
+        qdisc_destroy(parent->leaf.qdisc);
+
+        memset(&parent->inner, 0, sizeof(parent->inner));
+    }
+    parent->children_count += 1;
+    child->parent = parent;
+}
+
+/// Child must be deactivated
+static void hls_detach_child(struct hls_class *child, struct Qdisc *sch) {
+    struct hls_class *parent = child->parent;
+
+    if (unlikely(parent == NULL))
+        return;
+    
+    parent->children_count -=1;
+    if (parent->children_count == 0) {
+        // Last child, change parent to leaf.
+        memset(&parent->leaf, 0, sizeof(parent->leaf));
+	    parent->leaf.qdisc = qdisc_create_dflt(sch->dev_queue, &pfifo_qdisc_ops, parent->common.classid);
+    }
+}
+
 static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 			    struct nlattr **tca, unsigned long *arg)
 {
 	struct hls_sched *q = qdisc_priv(sch);
 	struct hls_class *cl = (struct hls_class *)*arg;
+    struct hls_class *parent;
 	struct nlattr *opt = tca[TCA_OPTIONS];
 	struct nlattr *tb[TCA_HLS_MAX + 1];
     struct tc_hls_opt *hopt;
@@ -108,6 +258,7 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
     }
     hopt = nla_data(tb[TCA_HLS_PARMS]);
 
+    parent = parentid == TC_H_ROOT ? NULL : hls_find(parentid, sch);
     quantum = hopt->weight * 1000;
 
 	if (cl != NULL) {
@@ -123,6 +274,8 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 
 		sch_tree_lock(sch);
         cl->quantum = quantum;
+        hls_detach_child(cl, sch);
+        hls_attach_child(cl, parent, q);
 		sch_tree_unlock(sch);
 
 		return 0;
@@ -134,12 +287,12 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 
 	cl->common.classid = classid;
 	cl->quantum	   = quantum;
-	cl->qdisc	   = qdisc_create_dflt(sch->dev_queue,
+	cl->leaf.qdisc	   = qdisc_create_dflt(sch->dev_queue,
 					       &pfifo_qdisc_ops, classid);
-	if (cl->qdisc == NULL)
-		cl->qdisc = &noop_qdisc;
+	if (cl->leaf.qdisc == NULL)
+		cl->leaf.qdisc = &noop_qdisc;
 	else
-		qdisc_hash_add(cl->qdisc, true);
+		qdisc_hash_add(cl->leaf.qdisc, true);
 
 	if (tca[TCA_RATE]) {
 		err = gen_replace_estimator(&cl->bstats, NULL, &cl->rate_est,
@@ -147,7 +300,7 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 					    qdisc_root_sleeping_running(sch),
 					    tca[TCA_RATE]);
 		if (err) {
-			qdisc_destroy(cl->qdisc);
+			qdisc_destroy(cl->leaf.qdisc);
 			kfree(cl);
 			return err;
 		}
@@ -155,6 +308,7 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 
 	sch_tree_lock(sch);
 	qdisc_class_hash_insert(&q->clhash, &cl->common);
+    hls_attach_child(cl, parent, q);
 	sch_tree_unlock(sch);
 
 	qdisc_class_hash_grow(sch, &q->clhash);
@@ -166,7 +320,7 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 static void hls_destroy_class(struct Qdisc *sch, struct hls_class *cl)
 {
 	gen_kill_estimator(&cl->rate_est);
-	qdisc_destroy(cl->qdisc);
+	qdisc_destroy(cl->leaf.qdisc);
 	kfree(cl);
 }
 
@@ -180,8 +334,14 @@ static int hls_delete_class(struct Qdisc *sch, unsigned long arg)
 
 	sch_tree_lock(sch);
 
-	hls_purge_queue(cl);
+    if (cl == q->root)
+        q->root = NULL;
+
+    hls_purge_queue(cl);
+    hls_deactivate_leaf(cl);
+    hls_detach_child(cl, sch);
 	qdisc_class_hash_remove(&q->clhash, &cl->common);
+
 
 	sch_tree_unlock(sch);
 
@@ -234,7 +394,7 @@ static int hls_graft_class(struct Qdisc *sch, unsigned long arg,
 			new = &noop_qdisc;
 	}
 
-	*old = qdisc_replace(sch, new, &cl->qdisc);
+	*old = qdisc_replace(sch, new, &cl->leaf.qdisc);
 	return 0;
 }
 
@@ -242,7 +402,7 @@ static struct Qdisc *hls_class_leaf(struct Qdisc *sch, unsigned long arg)
 {
 	struct hls_class *cl = (struct hls_class *)arg;
 
-	return cl->qdisc;
+	return cl->leaf.qdisc;
 }
 
 static void hls_qlen_notify(struct Qdisc *csh, unsigned long arg)
@@ -260,7 +420,7 @@ static int hls_dump_class(struct Qdisc *sch, unsigned long arg,
 
 	tcm->tcm_parent	= TC_H_ROOT;
 	tcm->tcm_handle	= cl->common.classid;
-	tcm->tcm_info	= cl->qdisc->handle;
+	tcm->tcm_info	= cl->leaf.qdisc->handle;
 
 	nest = nla_nest_start(skb, TCA_OPTIONS);
 	if (nest == NULL)
@@ -278,7 +438,7 @@ static int hls_dump_class_stats(struct Qdisc *sch, unsigned long arg,
 {
     /*
 	struct hls_class *cl = (struct hls_class *)arg;
-	__u32 qlen = cl->qdisc->q.qlen;
+	__u32 qlen = cl->leaf.qdisc->q.qlen;
 	struct tc_hls_stats xstats;
 
 	memset(&xstats, 0, sizeof(xstats));
@@ -288,7 +448,7 @@ static int hls_dump_class_stats(struct Qdisc *sch, unsigned long arg,
 	if (gnet_stats_copy_basic(qdisc_root_sleeping_running(sch),
 				  d, NULL, &cl->bstats) < 0 ||
 	    gnet_stats_copy_rate_est(d, &cl->rate_est) < 0 ||
-	    gnet_stats_copy_queue(d, NULL, &cl->qdisc->qstats, qlen) < 0)
+	    gnet_stats_copy_queue(d, NULL, &cl->leaf.qdisc->qstats, qlen) < 0)
 		return -1;
 
 	return gnet_stats_copy_app(d, &xstats, sizeof(xstats));
@@ -373,7 +533,7 @@ static int hls_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		return err;
 	}
 
-	err = qdisc_enqueue(skb, cl->qdisc, to_free);
+	err = qdisc_enqueue(skb, cl->leaf.qdisc, to_free);
 	if (unlikely(err != NET_XMIT_SUCCESS)) {
 		if (net_xmit_drop_count(err)) {
 			cl->qstats.drops++;
@@ -382,7 +542,8 @@ static int hls_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		return err;
 	}
 
-	if (cl->qdisc->q.qlen == 1) {
+	if (cl->leaf.qdisc->q.qlen == 1) {
+        hls_activate_leaf(cl, q);
 		list_add_tail(&cl->alist, &q->active);
 		cl->deficit = cl->quantum;
 	}
@@ -403,20 +564,22 @@ static struct sk_buff *hls_dequeue(struct Qdisc *sch)
 		goto out;
 	while (1) {
 		cl = list_first_entry(&q->active, struct hls_class, alist);
-		skb = cl->qdisc->ops->peek(cl->qdisc);
+		skb = cl->leaf.qdisc->ops->peek(cl->leaf.qdisc);
 		if (skb == NULL) {
-			qdisc_warn_nonwc(__func__, cl->qdisc);
+			qdisc_warn_nonwc(__func__, cl->leaf.qdisc);
 			goto out;
 		}
 
 		len = qdisc_pkt_len(skb);
 		if (len <= cl->deficit) {
 			cl->deficit -= len;
-			skb = qdisc_dequeue_peeked(cl->qdisc);
+			skb = qdisc_dequeue_peeked(cl->leaf.qdisc);
 			if (unlikely(skb == NULL))
 				goto out;
-			if (cl->qdisc->q.qlen == 0)
-				list_del(&cl->alist);
+			if (cl->leaf.qdisc->q.qlen == 0) {
+                hls_deactivate_leaf(cl);
+                list_del(&cl->alist);
+            }
 
 			bstats_update(&cl->bstats, skb);
 			qdisc_bstats_update(sch, skb);
@@ -444,6 +607,8 @@ static int hls_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 	if (err < 0)
 		return err;
 	INIT_LIST_HEAD(&q->active);
+    INIT_LIST_HEAD(&q->active_leaves);
+
 	return 0;
 }
 
@@ -455,11 +620,14 @@ static void hls_reset_qdisc(struct Qdisc *sch)
 
 	for (i = 0; i < q->clhash.hashsize; i++) {
 		hlist_for_each_entry(cl, &q->clhash.hash[i], common.hnode) {
-			if (cl->qdisc->q.qlen)
+			if (hls_is_leaf(cl) && hls_is_active_leaf(cl)) {
+                hls_deactivate_leaf(cl);
 				list_del(&cl->alist);
-			qdisc_reset(cl->qdisc);
+            }
+			qdisc_reset(cl->leaf.qdisc);
 		}
 	}
+    q->root = NULL;
 	sch->qstats.backlog = 0;
 	sch->q.qlen = 0;
 }
