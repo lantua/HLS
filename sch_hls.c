@@ -24,7 +24,6 @@ struct tc_hls_opt {
 struct tc_hls_glob {
     __u64 rate;         // limited rate of the link
     __u32 defcls;       // default class number
-    __u32 direct_qlen;  // Length of direct queue, in packets
 };
 struct tc_hls_xstats {
     __u32 deactivate_count;
@@ -687,7 +686,7 @@ static const struct Qdisc_class_ops hls_class_ops = {
 
 static struct Qdisc_ops hls_qdisc_ops __read_mostly = {
 	.cl_ops		= &hls_class_ops,
-	.id		= "hdrr",
+	.id		= "hls",
 	.priv_size	= sizeof(struct hls_sched),
 	.enqueue	= hls_enqueue,
 	.dequeue	= hls_dequeue,
