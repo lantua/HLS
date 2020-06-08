@@ -162,7 +162,7 @@ static void hls_will_add_busy_child_inner(struct hls_class* cl, Round round) {
         // `busy_children_weight` is about to change, but our semantic dictates that `fairshare`
         // depends on `busy_children_weight` at the beginning of the round. So we compute `fairshare`
         // before we lost the correct value.
-        hls_compute_fairshare(parent);
+        hls_compute_fairshare(cl);
         return;
     }
 
@@ -302,7 +302,6 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 	struct nlattr *opt = tca[TCA_OPTIONS];
 	struct nlattr *tb[TCA_HLS_MAX + 1];
     struct tc_hls_opt *hopt;
-	u32 quantum;
 	int err;
 
 	if (!opt)
@@ -319,7 +318,6 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
     hopt = nla_data(tb[TCA_HLS_PARMS]);
 
     parent = parentid == TC_H_ROOT ? NULL : hls_find(parentid, sch);
-    quantum = hopt->weight * 1000;
 
 	if (cl != NULL) {
         if (!hls_is_leaf(cl)) {
@@ -383,11 +381,9 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 	qdisc_class_hash_insert(&q->clhash, &cl->common);
     hls_attach_child(cl, parent, q);
 
-    if (parent == NULL) {
+    if (parent == NULL)
         q->root = cl;
-    } else {
-        q->root->quota += hopt->weight;
-    }
+    q->root->quota += hopt->weight;
 	sch_tree_unlock(sch);
 
 	qdisc_class_hash_grow(sch, &q->clhash);
