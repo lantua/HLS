@@ -21,10 +21,6 @@
 struct tc_hls_opt {
     __u32 weight;
 };
-struct tc_hls_glob {
-    __u64 rate;         // limited rate of the link
-    __u32 defcls;       // default class number
-};
 struct tc_hls_xstats {
     __u32 deactivate_count;
     __u32 mark_idle_count;
@@ -32,7 +28,7 @@ struct tc_hls_xstats {
 enum {
 	TCA_HLS_UNSPEC,
 	TCA_HLS_PARMS,
-	TCA_HLS_INIT,
+    TCA_HLS_MAX_PACKET_SIZE,
 	__TCA_HLS_MAX,
 };
 #define TCA_HLS_MAX (__TCA_HLS_MAX - 1)
@@ -53,6 +49,7 @@ struct hls_class {
     struct hls_class* parent;
     u32 weight, children_count;
     int quota;
+    u32 max_packet_size;
 
     union {
         struct {
@@ -76,6 +73,7 @@ struct hls_sched {
     struct list_head round_marker;
     struct hls_class *root;
     Round round;
+    u32 default_max_packet_size;
 };
 
 static bool hls_is_leaf(struct hls_class* cl) { return cl->children_count == 0; }
@@ -190,6 +188,7 @@ static void hls_did_become_busy_leaf(struct hls_class* cl, struct hls_sched *q) 
 
     // Add to busy list, this will always be behind round_marker.
     list_add_tail(&cl->leaf.busy_list, &q->busy_leaves);
+    q->root->quota += cl->max_packet_size;    
 }
 
 static void hls_did_become_idle_inner(struct hls_class* cl) {
@@ -232,6 +231,7 @@ static void hls_did_become_idle_leaf(struct hls_class* cl, struct hls_sched* q) 
 
     // Remove from busy list.
     list_del(&cl->leaf.busy_list);
+    q->root->quota -= cl->max_packet_size;
 }
 
 static struct hls_class *hls_find_class(struct Qdisc *sch, u32 classid)
@@ -256,7 +256,7 @@ static void hls_purge_queue(struct hls_class *cl)
 
 static const struct nla_policy hls_policy[TCA_HLS_MAX + 1] = {
     [TCA_HLS_PARMS] = { .len = sizeof(struct tc_hls_opt) },
-    [TCA_HLS_INIT] = { .len = sizeof(struct tc_hls_glob) },
+    [TCA_HLS_MAX_PACKET_SIZE] = { .len = sizeof(__u32) },
 };
 
 /// Child must be deactivated
@@ -336,10 +336,17 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 		}
 
 		sch_tree_lock(sch);
+        hls_detach_child(cl, sch);
+
         q->root->quota -= cl->weight;
         cl->weight = hopt->weight;
+        if (tb[TCA_HLS_MAX_PACKET_SIZE]) {
+            cl->max_packet_size = *(__u32*)nla_data(tb[TCA_HLS_MAX_PACKET_SIZE]);
+        } else {
+            cl->max_packet_size = q->default_max_packet_size;
+        }
         q->root->quota += cl->weight;
-        hls_detach_child(cl, sch);
+
         hls_attach_child(cl, parent, q);
 		sch_tree_unlock(sch);
 
@@ -358,6 +365,11 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 
 	cl->common.classid = classid;
     cl->weight = hopt->weight;
+    if (tb[TCA_HLS_MAX_PACKET_SIZE]) {
+        cl->max_packet_size = *(__u32*)nla_data(tb[TCA_HLS_MAX_PACKET_SIZE]);
+    } else {
+        cl->max_packet_size = q->default_max_packet_size;
+    }
 	cl->leaf.qdisc	   = qdisc_create_dflt(sch->dev_queue,
 					       &pfifo_qdisc_ops, classid);
 	if (cl->leaf.qdisc == NULL)
@@ -381,8 +393,9 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 	qdisc_class_hash_insert(&q->clhash, &cl->common);
     hls_attach_child(cl, parent, q);
 
-    if (parent == NULL)
+    if (parent == NULL) {
         q->root = cl;
+    }
     q->root->quota += hopt->weight;
 	sch_tree_unlock(sch);
 
@@ -702,9 +715,17 @@ out:
 static int hls_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 {
 	struct hls_sched *q = qdisc_priv(sch);
+    struct nlattr *tb[TCA_HLS_MAX + 1];
 	int err;
 
-	err = tcf_block_get(&q->block, &q->filter_list, sch);
+    err = nla_parse_nested(tb, TCA_HLS_MAX, opt, hls_policy, NULL);
+    if (err < 0)
+        return err;
+
+    if (tb[TCA_HLS_MAX_PACKET_SIZE] == NULL)
+        return -EINVAL;
+
+    err = tcf_block_get(&q->block, &q->filter_list, sch);
 	if (err)
 		return err;
 	err = qdisc_class_hash_init(&q->clhash);
@@ -713,8 +734,9 @@ static int hls_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
     INIT_LIST_HEAD(&q->busy_leaves);
     list_add_tail(&q->round_marker, &q->busy_leaves);
     q->root = NULL;
+    q->default_max_packet_size = *(__u32*)nla_data(tb[TCA_HLS_MAX_PACKET_SIZE]);
 
-	return 0;
+    return 0;
 }
 
 static void hls_reset_qdisc(struct Qdisc *sch)
