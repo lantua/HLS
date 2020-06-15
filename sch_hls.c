@@ -97,7 +97,7 @@ static void hls_compute_fairshare(struct hls_class* cl) {
         cl->inner.fairshare = 0;
     } else {
         // Pretty much any rounding will suffice, but sum-of-quota must be adjusted appropriately.
-        cl->inner.fairshare = cl->quota / cl->inner.busy_children_weight + 1;
+        cl->inner.fairshare = cl->quota / cl->inner.busy_children_weight;
     }
 }
 
@@ -120,6 +120,7 @@ static u32 hls_current_inner_fairshare(struct hls_class* cl, Round round) {
         hls_take_quota(cl, hls_current_inner_fairshare(parent, round));
     }
 
+    cl->inner.round = round;
     hls_compute_fairshare(cl);
     return cl->inner.fairshare;
 }
@@ -408,6 +409,7 @@ static int hls_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 static void hls_destroy_class(struct Qdisc *sch, struct hls_class *cl)
 {
 	gen_kill_estimator(&cl->rate_est);
+    tcf_block_put(cl->block);
     if (hls_is_leaf(cl)) {
 	    qdisc_destroy(cl->leaf.qdisc);
     }
@@ -494,7 +496,10 @@ static struct Qdisc *hls_class_leaf(struct Qdisc *sch, unsigned long arg)
 {
 	struct hls_class *cl = (struct hls_class *)arg;
 
-	return cl->leaf.qdisc;
+    if (hls_is_leaf(cl))
+        return cl->leaf.qdisc;
+
+    return NULL;
 }
 
 static void hls_qlen_notify(struct Qdisc *sch, unsigned long arg)
