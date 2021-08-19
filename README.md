@@ -10,7 +10,9 @@ In HLS, each class is assigned a positive integer *weight*.
 The weight of each class represents the number of bytes that it can transmit relative to its sibling classes.
 Classes with large weights are allowed to transmit more data compared to classes with smaller weights if they share the same parent in the hierarchy.
 
-#Installation
+The analysis of HLS can be found in *[in proceeding]*. Note that the current implementation of HLS does not include the surplus round. Every round still recomputes the fair quota of the root class.
+
+# Installation
 
 TODO
 
