@@ -10,7 +10,7 @@ In HLS, each class is assigned a positive integer *weight*.
 The weight of each class represents the number of bytes that it can transmit relative to its sibling classes.
 Classes with large weights are allowed to transmit more data compared to classes with smaller weights if they share the same parent in the hierarchy.
 
-The analysis of HLS can be found in *[in proceeding]*. Note that the current implementation of HLS does not include the surplus round. Every round still recomputes the fair quota of the root class.
+The analysis and details of HLS can be found in *[in proceeding]*. **Note that the current implementation of HLS does not include the surplus round. Every round still recomputes the fair quota of the root class.**
 
 # Installation
 
@@ -34,11 +34,9 @@ When enqueuing a packet, HLS consults the filters attached to the root class:
 HLS operates in rounds.
 In each round, HLS computes the number of bytes that each class can transmit, called its *quota*.
 HLS ensures that the quotas of sibling classes are proportional to their weights.
-For example, if classes *i* and *j* are siblings, with class *i* having double the weight of class *j*, when both classes are backlogged, HLS allocates double the quota to class *i* compared to class *j*.
+For example, if classes `i` and `j` are siblings, with class `i` having double the weight of class `j`, when both classes are backlogged, HLS allocates double the quota to class `i` compared to class `j`.
 
-The total weights of all active classes (classes that are backlogged at the beginning of the round) and the total maximum packet sizes of active leaf classes determine the amount of quota allocated to each class, which dictates the round size.
-One can increase the weight of the root class to increase the round size as needed.
-It is recommended that the weight of the root class is set to zero or a small value.
+The total weights of all non-root active classes (classes that are backlogged at the beginning of the round) and the total maximum packet sizes of active leaf classes determine the amount of quota allocated to each class, which dictates the round size.
 
 # Usage
 
